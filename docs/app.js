@@ -4,15 +4,15 @@ import {newState,parseRoster,validateState,importRoster,lookup,pack,undoPack,exp
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const time=iso=>new Date(iso).toLocaleString('ja-JP',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
-let state=newState(),db,ready=false,page='scan',filter='all',ocrBusy=false,pendingWrites=0,stream=null,photo=null,selected=null,confirmAction=null,toastTimer,importName='貼り付けた番号一覧';
+let state=newState(),db,ready=false,page='scan',filter='all',ocrBusy=false,pendingWrites=0,boxChanging=false,stream=null,photo=null,selected=null,confirmAction=null,toastTimer,importName='貼り付けた番号一覧';
 const channel='BroadcastChannel' in window?new BroadcastChannel('packing-notebook-v1'):null;
 const buttons=['open-camera','pick-photo','manual-toggle'];
 function toast(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,4500);}
 function problem(error){toast(error?.message||String(error));}
 function openDB(){return new Promise((resolve,reject)=>{const req=indexedDB.open('terminal-packing-v1',1);req.onupgradeneeded=()=>req.result.createObjectStore('notebook');req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);req.onblocked=()=>reject(new Error('別の画面を閉じてから、もう一度開いてください。'));});}
 function readState(){return new Promise((resolve,reject)=>{const tx=db.transaction('notebook','readonly');const req=tx.objectStore('notebook').get('state');req.onsuccess=()=>{try{resolve(req.result?validateState(req.result):newState());}catch(e){reject(e);}};req.onerror=()=>reject(req.error);});}
-function change(mutator,{replace=false}={}){pendingWrites++;return new Promise((resolve,reject)=>{if(!db||(!ready&&!replace))return reject(new Error('保存先の準備ができていません。'));const tx=db.transaction('notebook','readwrite');const store=tx.objectStore('notebook');let next,issue;const req=store.get('state');req.onsuccess=()=>{try{const current=replace?newState():(req.result?validateState(req.result):newState());next=mutator(current);next.updatedAt=new Date().toISOString();validateState(next);store.put(next,'state');}catch(e){issue=e;tx.abort();}};tx.oncomplete=()=>{state=next;ready=true;$('fatal').hidden=true;render();channel?.postMessage('changed');resolve(next);};tx.onabort=tx.onerror=()=>reject(issue||new Error('記録を保存できませんでした。梱包完了にはしていません。空き容量などを確認してください。'));}).finally(()=>{pendingWrites--;});}
-channel?.addEventListener('message',async()=>{if(!db)return;try{state=await readState();render();if(selected)showMatch(selected.id,selected.image);}catch(e){problem(e);}});
+function change(mutator,{replace=false}={}){pendingWrites++;return new Promise((resolve,reject)=>{if(!db||(!ready&&!replace))return reject(new Error('保存先の準備ができていません。'));const tx=db.transaction('notebook','readwrite');const store=tx.objectStore('notebook');let next,issue;const req=store.get('state');req.onsuccess=()=>{try{const current=replace?newState():(req.result?validateState(req.result):newState());next=mutator(current);next.updatedAt=new Date().toISOString();validateState(next);store.put(next,'state');}catch(e){issue=e;tx.abort();}};tx.oncomplete=()=>{state=next;ready=true;$('fatal').hidden=true;render();channel?.postMessage('changed');resolve(next);};tx.onabort=tx.onerror=()=>reject(issue||new Error('記録を保存できませんでした。梱包完了にはしていません。空き容量などを確認してください。'));}).finally(()=>{pendingWrites--;renderBoxControls();});}
+channel?.addEventListener('message',async()=>{if(!db)return;try{state=await readState();render();if(selected){if(selected.box!==state.box&&lookup(state,selected.id).status==='ready'){clearResult();toast('別の画面で箱番号が変わりました。箱を確認して、もう一度端末番号を照合してください。');}else showMatch(selected.id,selected.image);}}catch(e){problem(e);}});
 function nav(next){page=next;for(const name of ['scan','records','setup'])$('page-'+name).hidden=name!==next;document.querySelectorAll('.bottom-nav [data-page]').forEach(b=>{b.classList.toggle('active',b.dataset.page===next);b.setAttribute('aria-current',b.dataset.page===next?'page':'false');});if(next==='records')renderRecords();window.scrollTo({top:0,behavior:'instant'});}
 document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>nav(b.dataset.page)));
 $('start-setup').onclick=()=>nav('setup');
@@ -22,7 +22,7 @@ function render(){
  const total=state.roster.length,count=state.records.length;
  $('stat-packed').innerHTML=count+'<small>台</small>';$('stat-total').innerHTML=(total||'—')+'<small>台</small>';$('stat-left').innerHTML=(total?total-count:'—')+'<small>台</small>';$('progress-bar').style.width=(total?100*count/total:0)+'%';
  $('onboard').hidden=total>0;
- if(document.activeElement!==$('box-input'))$('box-input').value=state.box;
+ renderBoxControls();
  $('current-box-count').textContent=state.records.filter(r=>r.box===state.box).length+' 台';
  buttons.forEach(id=>$(id).disabled=!ready||!total||ocrBusy);
  $('recent-list').innerHTML=count?[...state.records].sort((a,b)=>b.packedAt.localeCompare(a.packedAt)).slice(0,4).map(r=>`<div class="recent-row"><div><strong>${esc(r.id)}</strong><small>${esc(r.box)} · ${time(r.packedAt)}</small></div><svg class="recent-check"><use href="#i-check"/></svg></div>`).join(''):empty('まだ梱包の記録がありません。<br>最初の1台から始めましょう。');
@@ -39,7 +39,35 @@ function renderRecords(){
 }
 $('search-input').oninput=renderRecords;
 document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;document.querySelectorAll('[data-filter]').forEach(n=>n.classList.toggle('active',n===b));renderRecords();});
-$('box-input').onchange=async()=>{try{await change(s=>({...s,box:$('box-input').value.trim()}));if(selected)showMatch(selected.id,selected.image);}catch(e){$('box-input').value=state.box;problem(e);}};
+const standardBoxes=Array.from({length:129},(_,i)=>`箱${String(i+1).padStart(2,'0')}`);
+let boxOptionsKey='';
+function boxLocked(){return !ready||boxChanging||pendingWrites>0||ocrBusy||Boolean(selected&&lookup(state,selected.id).status==='ready');}
+function renderBoxControls(){
+ const names=[...new Set([...standardBoxes,state.box,...state.records.map(r=>r.box),...state.events.map(e=>e.box)])];
+ const key=JSON.stringify(names);
+ if(key!==boxOptionsKey){$('box-input').replaceChildren(...names.map(name=>{const option=document.createElement('option');option.value=option.textContent=name;return option;}));boxOptionsKey=key;}
+ $('box-input').value=state.box;
+ const index=standardBoxes.indexOf(state.box),locked=boxLocked();
+ $('box-input').disabled=locked;
+ $('prev-box').disabled=locked||index<=0;
+ $('next-box').disabled=locked||index<0||index===standardBoxes.length-1;
+ $('box-hint').textContent=selected&&lookup(state,selected.id).status==='ready'
+  ? '梱包完了にするか、照合結果を閉じると箱を替えられます。'
+  : index<0 ? '保存済みの箱名です。別の箱へ移るときは一覧から選べます。'
+  : '振り分け表にも、同じ箱番号を書いてください。';
+}
+async function switchBox(target){
+ if(boxLocked())return renderBoxControls();
+ if(target===state.box)return;
+ const from=state.box;
+ boxChanging=true;renderBoxControls();
+ try{await change(s=>{if(s.box!==from)throw new Error('別の画面で箱番号が変わりました。現在の箱を確認してください。');return {...s,box:target};});clearResult();toast(`${target} に切り替えました。箱の表示を確認してください。`);}
+ catch(e){problem(e);try{state=await readState();render();}catch{}}
+ finally{boxChanging=false;renderBoxControls();}
+}
+$('box-input').onchange=()=>{const target=$('box-input').value;$('box-input').value=state.box;switchBox(target);};
+$('prev-box').onclick=()=>{const i=standardBoxes.indexOf(state.box);if(i>0)switchBox(standardBoxes[i-1]);};
+$('next-box').onclick=()=>{const i=standardBoxes.indexOf(state.box);if(i>=0&&i<standardBoxes.length-1)switchBox(standardBoxes[i+1]);};
 function confirm(title,body,action,button='確定する'){confirmAction=action;$('confirm-title').textContent=title;$('confirm-body').innerHTML=body;$('confirm-ok').textContent=button;$('confirm-ok').disabled=false;$('confirm-dialog').showModal();}
 function closeConfirm(){$('confirm-dialog').close();confirmAction=null;}
 $('confirm-close').onclick=$('confirm-cancel').onclick=closeConfirm;
@@ -56,9 +84,9 @@ function showMatch(raw,image){
  if(status==='ready'){$('result').innerHTML=`<p class="result-kicker">✓ 対象の端末・未梱包</p>${number}<p>シールと8桁すべてを見比べてください。<br><strong>${esc(state.box)}</strong> に入れてから完了を押します。</p><div class="result-actions"><button type="button" id="pack-now" class="primary">${esc(state.box)} に梱包完了</button><button type="button" id="dismiss-result" class="secondary">戻る</button></div>`;$('pack-now').onclick=completePack;}
  else if(status==='packed'){const r=result.record;$('result').classList.add('warning');$('result').innerHTML=`<p class="result-kicker">登録済みの番号です</p>${number}<p><strong>${esc(r.box)}</strong> に梱包済みです。<br>${time(r.packedAt)} に記録されています。</p><div class="result-actions"><button type="button" id="dismiss-result" class="secondary">次の端末へ</button><button type="button" id="undo-result" class="text-button">この記録を取り消す</button></div>`;$('undo-result').onclick=()=>askUndo(id);}
  else{$('result').classList.add('danger');const title=status==='not-found'?'番号一覧にありません':status==='no-roster'?'番号一覧を登録してください':'8桁の番号を入力してください';$('result').innerHTML=`<p class="result-kicker">${title}</p>${number}<p>番号を確認し、撮り直すか手入力で照合してください。<br>この状態では梱包記録を登録できません。</p><button type="button" id="dismiss-result" class="secondary">戻る</button>`;}
- $('dismiss-result').onclick=clearResult;$('result').scrollIntoView({block:'nearest',behavior:'smooth'});
+ $('dismiss-result').onclick=clearResult;renderBoxControls();$('result').scrollIntoView({block:'nearest',behavior:'smooth'});
 }
-function clearResult(){selected=null;$('result').hidden=true;$('result').replaceChildren();$('manual-id').value='';}
+function clearResult(){selected=null;$('result').hidden=true;$('result').replaceChildren();$('manual-id').value='';renderBoxControls();}
 async function completePack(){const current=selected;if(!current)return;const b=$('pack-now');b.disabled=true;try{await change(s=>{if(s.box!==current.box)throw new Error('箱番号が変わりました。入れる箱を確認して、もう一度完了を押してください。');return pack(s,current.id,current.box,new Date().toISOString());});clearResult();toast(`${current.id} を ${current.box} に記録しました。`);if(state.records.length===1)navigator.storage?.persist?.().catch(()=>{});}catch(e){problem(e);try{state=await readState();render();showMatch(current.id,current.image);}catch{b.disabled=false;}}}
 
 async function decodeText(file){if(file.size>5*1024*1024)throw new Error('番号一覧は5MB以内のファイルを選んでください。');const bytes=await file.arrayBuffer();let text=new TextDecoder('utf-8').decode(bytes);if(text.includes('\uFFFD')){try{text=new TextDecoder('shift_jis').decode(bytes);}catch{}}return text;}

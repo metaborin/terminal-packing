@@ -1,16 +1,17 @@
+import {initPWA} from './pwa.js';
 import {newState,parseRoster,validateState,importRoster,lookup,pack,undoPack,exportCSV,boxSummary,normalizeId} from './core.js';
 
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const time=iso=>new Date(iso).toLocaleString('ja-JP',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
-let state=newState(),db,ready=false,page='scan',filter='all',ocrBusy=false,stream=null,photo=null,selected=null,confirmAction=null,toastTimer,importName='貼り付けた番号一覧';
+let state=newState(),db,ready=false,page='scan',filter='all',ocrBusy=false,pendingWrites=0,stream=null,photo=null,selected=null,confirmAction=null,toastTimer,importName='貼り付けた番号一覧';
 const channel='BroadcastChannel' in window?new BroadcastChannel('packing-notebook-v1'):null;
 const buttons=['open-camera','pick-photo','manual-toggle'];
 function toast(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,4500);}
 function problem(error){toast(error?.message||String(error));}
 function openDB(){return new Promise((resolve,reject)=>{const req=indexedDB.open('terminal-packing-v1',1);req.onupgradeneeded=()=>req.result.createObjectStore('notebook');req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);req.onblocked=()=>reject(new Error('別の画面を閉じてから、もう一度開いてください。'));});}
 function readState(){return new Promise((resolve,reject)=>{const tx=db.transaction('notebook','readonly');const req=tx.objectStore('notebook').get('state');req.onsuccess=()=>{try{resolve(req.result?validateState(req.result):newState());}catch(e){reject(e);}};req.onerror=()=>reject(req.error);});}
-function change(mutator,{replace=false}={}){return new Promise((resolve,reject)=>{if(!db||(!ready&&!replace))return reject(new Error('保存先の準備ができていません。'));const tx=db.transaction('notebook','readwrite');const store=tx.objectStore('notebook');let next,issue;const req=store.get('state');req.onsuccess=()=>{try{const current=replace?newState():(req.result?validateState(req.result):newState());next=mutator(current);next.updatedAt=new Date().toISOString();validateState(next);store.put(next,'state');}catch(e){issue=e;tx.abort();}};tx.oncomplete=()=>{state=next;ready=true;$('fatal').hidden=true;render();channel?.postMessage('changed');resolve(next);};tx.onabort=tx.onerror=()=>reject(issue||new Error('記録を保存できませんでした。梱包完了にはしていません。空き容量などを確認してください。'));});}
+function change(mutator,{replace=false}={}){pendingWrites++;return new Promise((resolve,reject)=>{if(!db||(!ready&&!replace))return reject(new Error('保存先の準備ができていません。'));const tx=db.transaction('notebook','readwrite');const store=tx.objectStore('notebook');let next,issue;const req=store.get('state');req.onsuccess=()=>{try{const current=replace?newState():(req.result?validateState(req.result):newState());next=mutator(current);next.updatedAt=new Date().toISOString();validateState(next);store.put(next,'state');}catch(e){issue=e;tx.abort();}};tx.oncomplete=()=>{state=next;ready=true;$('fatal').hidden=true;render();channel?.postMessage('changed');resolve(next);};tx.onabort=tx.onerror=()=>reject(issue||new Error('記録を保存できませんでした。梱包完了にはしていません。空き容量などを確認してください。'));}).finally(()=>{pendingWrites--;});}
 channel?.addEventListener('message',async()=>{if(!db)return;try{state=await readState();render();if(selected)showMatch(selected.id,selected.image);}catch(e){problem(e);}});
 function nav(next){page=next;for(const name of ['scan','records','setup'])$('page-'+name).hidden=name!==next;document.querySelectorAll('.bottom-nav [data-page]').forEach(b=>{b.classList.toggle('active',b.dataset.page===next);b.setAttribute('aria-current',b.dataset.page===next?'page':'false');});if(next==='records')renderRecords();window.scrollTo({top:0,behavior:'instant'});}
 document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>nav(b.dataset.page)));
@@ -99,12 +100,9 @@ async function readCanvas(c){
  }catch(e){$('result').className='result-card warning';$('result').innerHTML='<p class="result-kicker">読み取りを開始できませんでした</p><p>初回は通信できる場所で「準備・保存」から読み取りを準備してください。手入力でも作業できます。</p>';$('manual-form').hidden=false;console.error('OCR failed',e?.message);}
  finally{ocrBusy=false;render();}
 }
-function networkState(){$('offline-notice').hidden=navigator.onLine;}
-window.addEventListener('online',networkState);window.addEventListener('offline',networkState);networkState();
-let registration;
-async function offlineStatus(){if(!('caches' in window))return;const c=await caches.open('packing-offline-v1');if(await c.match('./offline-ready'))$('offline-status').textContent='準備済みです。通信がなくても読み取り・記録を使えます。';}
-$('prepare-offline').onclick=async()=>{const b=$('prepare-offline');b.disabled=true;try{if(!registration)throw new Error('この環境ではオフライン準備ができません。Safariでアプリを開いてください。');await navigator.serviceWorker.ready;const worker=registration.active;if(!worker)throw new Error('画面を一度開き直してから、お試しください。');await new Promise((resolve,reject)=>{const mc=new MessageChannel();const timer=setTimeout(()=>reject(new Error('準備に時間がかかっています。通信状態を確認して、再度お試しください。')),180000);mc.port1.onmessage=e=>{if(e.data.progress)$('offline-status').textContent=e.data.progress;if(e.data.done){clearTimeout(timer);resolve();}if(e.data.error){clearTimeout(timer);reject(new Error(e.data.error));}};worker.postMessage({type:'PREPARE_OFFLINE'},[mc.port2]);});$('offline-status').textContent='準備できました。通信がなくても読み取り・記録を使えます。';toast('オフラインの準備ができました。');}catch(e){$('offline-status').textContent=e.message;}finally{b.disabled=false;}};
-async function init(){try{db=await openDB();state=await readState();ready=true;render();}catch(e){$('fatal').hidden=false;$('fatal').textContent='このブラウザの保存先を開けません。プライベートブラウズを終了するか、Safariで開き直してください。既存の記録に問題がある場合は、控えを確認してください。';render();}
- if('serviceWorker' in navigator){try{registration=await navigator.serviceWorker.register('./sw.js',{scope:'./'});await offlineStatus();}catch{ $('offline-status').textContent='オフライン準備はこの環境では利用できません。通信できる状態でご利用ください。';}}
+async function init(){
+ try{db=await openDB();state=await readState();ready=true;render();}
+ catch(e){$('fatal').hidden=false;$('fatal').textContent='このブラウザの保存先を開けません。プライベートブラウズを終了するか、Safariで開き直してください。既存の記録に問題がある場合は、控えを確認してください。';render();}
+ initPWA({isBusy:()=>pendingWrites>0||ocrBusy||document.querySelector('dialog[open]')!==null||Boolean(selected&&lookup(state,selected.id).status==='ready')});
 }
 init();

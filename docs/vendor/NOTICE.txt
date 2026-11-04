@@ -1,0 +1,16 @@
+Local OCR components
+
+Tesseract.js 7.0.0 — https://github.com/naptha/tesseract.js
+License: Apache-2.0, see LICENSE-tesseract.md.
+Bundled dependency notices: see tesseract.min.js.LICENSE.txt and worker.min.js.LICENSE.txt.
+
+Tesseract.js-core 7.0.0 — https://github.com/naptha/tesseract.js-core
+License: Apache-2.0, see core/LICENSE.
+This app uses only the LSTM OCR engine and includes its baseline, SIMD and relaxed-SIMD variants.
+
+English LSTM model — https://github.com/tesseract-ocr/tessdata_fast
+Source: https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/eng.traineddata
+Retrieved: 2026-11-04. Compressed locally without modifying the model contents.
+License: Apache-2.0, see lang/LICENSE.
+
+All assets are served from this application's origin. OCR images are not uploaded.

@@ -1,0 +1,12 @@
+.DS_Store
+Thumbs.db
+node_modules/
+.env*
+*.log
+*.heic
+*.HEIC
+*.csv
+*.xlsx
+*backup*.json
+*バックアップ*.json
+test-results/

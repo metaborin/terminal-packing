@@ -1,5 +1,5 @@
 /* Bump APP_VERSION whenever the app shell changes. User records are in IndexedDB. */
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 const SCOPE = self.registration.scope;
 const SCOPE_URL = new URL(SCOPE);
 const CACHE_PREFIX = `terminal-packing:${encodeURIComponent(SCOPE_URL.pathname)}:`;
@@ -8,7 +8,7 @@ const SHELL_CACHE = `${SHELL_PREFIX}${APP_VERSION}`;
 // Bump this only when OCR code/models change; app updates retain the large downloads.
 const OCR_CACHE = `${CACHE_PREFIX}ocr:1`;
 const SHELL = [
-  './', './index.html', './style.css', './app.js', './core.js', './ocr.js', './pwa.js',
+  './', './index.html', './style.css', './app.js', './core.js', './ocr.js', './scan-consensus.js', './pwa.js',
   './manifest.webmanifest', './icon.svg', './icon-180.png', './icon-192.png',
   './icon-512.png', './licenses.html',
 ];

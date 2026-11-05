@@ -38,12 +38,17 @@ async function getWorker() {
       load_number_dawg: '0',
       load_punc_dawg: '0',
     }).then(async worker => {
-      await worker.setParameters({
-        tessedit_char_whitelist: '0123456789',
-        tessedit_pageseg_mode: '7',
-        user_defined_dpi: '300',
-      });
-      return worker;
+      try {
+        await worker.setParameters({
+          tessedit_char_whitelist: '0123456789',
+          tessedit_pageseg_mode: '7',
+          user_defined_dpi: '300',
+        });
+        return worker;
+      } catch (error) {
+        try { await worker.terminate(); } catch { /* Preserve the initialization error. */ }
+        throw error;
+      }
     }).catch(error => {
       workerPromise = null;
       throw error;
@@ -81,7 +86,10 @@ function prepare(source, contrast = false) {
     const threshold = low + (high - low) * .45;
     for (let i = 0; i < pixels.data.length; i += 4) {
       const gray = 0.299 * pixels.data[i] + 0.587 * pixels.data[i + 1] + 0.114 * pixels.data[i + 2];
-      const level = gray < threshold ? 0 : 255;
+      // Keep soft digit edges for live scanning; photo fallback retains binarization.
+      const level = contrast === 'stretch'
+        ? high > low ? Math.max(0, Math.min(255, Math.round((gray - low) * 255 / (high - low)))) : Math.round(gray)
+        : gray < threshold ? 0 : 255;
       pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = level;
     }
     ctx.putImageData(pixels, 0, 0);
@@ -124,6 +132,44 @@ export async function recognize(canvas, { onProgress } = {}) {
   } catch (error) {
     if (error?.message?.includes('写真を読み込めません')) throw error;
     throw new Error('番号を読み取れませんでした。シールを横向きで大きく写して再撮影するか、番号を入力してください。', { cause: error });
+  } finally {
+    progressListener = null;
+    busy = false;
+  }
+}
+
+/** Two differently processed readings must agree before a live frame is useful. */
+export async function recognizeLiveFrame(canvas, { onProgress } = {}) {
+  if (busy) throw new Error('読み取り中です。完了するまでお待ちください。');
+  busy = true;
+  progressListener = onProgress;
+  let worker;
+  try {
+    // Snapshot both variants before awaiting OCR; neither reads a later video frame.
+    const normal = prepare(canvas), contrast = prepare(canvas, 'stretch');
+    notify({ status: 'initializing api', progress: 0 });
+    worker = await getWorker();
+    await worker.setParameters({ tessedit_pageseg_mode: '7' });
+    const first = await worker.recognize(normal, {}, { text: true });
+    const second = await worker.recognize(contrast, {}, { text: true });
+    const readings = [first, second].map(result => {
+      const confidence = result.data.confidence;
+      return candidatesFromText(result.data.text, Number.isFinite(confidence) && confidence >= 0 && confidence <= 100 ? confidence : 0);
+    });
+    const text = first.data.text || '';
+    if (readings.some(candidates => candidates.length > 1)) return { candidates: [], text, reason: 'ambiguous' };
+    if (readings.some(candidates => candidates.length !== 1)) return { candidates: [], text, reason: 'empty' };
+    const [a, b] = readings.map(candidates => candidates[0]);
+    if (a.id !== b.id) return { candidates: [], text, reason: 'unstable' };
+    if (a.confidence < 70 || b.confidence < 70) return { candidates: [], text, reason: 'low-confidence' };
+    return { candidates: [{ id: a.id, confidence: Math.min(a.confidence, b.confidence) }], text, reason: 'agree' };
+  } catch (error) {
+    if (worker) {
+      workerPromise = null;
+      try { await worker.terminate(); } catch { /* A fresh worker will be created on retry. */ }
+    }
+    if (error?.message?.includes('写真を読み込めません')) throw error;
+    throw new Error('番号を読み取れませんでした。シールを横向きで大きく映して、もう一度お試しください。', { cause: error });
   } finally {
     progressListener = null;
     busy = false;

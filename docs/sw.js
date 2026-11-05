@@ -1,5 +1,5 @@
 /* Bump APP_VERSION whenever the app shell changes. User records are in IndexedDB. */
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 const SCOPE = self.registration.scope;
 const SCOPE_URL = new URL(SCOPE);
 const CACHE_PREFIX = `terminal-packing:${encodeURIComponent(SCOPE_URL.pathname)}:`;

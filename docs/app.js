@@ -124,6 +124,22 @@ $('restore').onclick=()=>$('restore-file').click();
 $('restore-file').onchange=async e=>{const f=e.target.files?.[0];if(!f)return;try{if(f.size>20*1024*1024)throw new Error('バックアップが大きすぎます。');const restored=validateState(JSON.parse(await f.text()));confirm('バックアップから復元しますか？',`<p>番号一覧 <strong>${restored.roster.length} 台</strong> ／ 梱包済み <strong>${restored.records.length} 台</strong></p><p>現在の一覧と記録を、このバックアップの内容に置き換えます。必要な現在の記録は、先にバックアップを保存してください。</p>`,async()=>{await change(()=>restored,{replace:true});$('box-advance-notice').hidden=true;clearResult();nav('scan');toast('バックアップから復元しました。');},'この内容に復元する');}catch(error){problem(new Error('復元できません：'+error.message));}e.target.value='';};
 
 // A session owns its stream, pending OCR and timer. Late results never reach another session.
+const cameraZoomLevels=[1,1.5,2],cameraZoomKey='terminal-packing-camera-zoom-v1';
+let cameraZoom=2;
+try{const saved=Number(localStorage.getItem(cameraZoomKey));if(cameraZoomLevels.includes(saved))cameraZoom=saved;}catch{}
+function renderCameraZoom(){
+ $('camera-video').style.transform=`scale(${cameraZoom})`;
+ document.querySelectorAll('[data-camera-zoom]').forEach(button=>{const active=Number(button.dataset.cameraZoom)===cameraZoom;button.setAttribute('aria-pressed',String(active));button.classList.toggle('active',active);});
+}
+function setCameraZoom(value){
+ if(!cameraZoomLevels.includes(value)||value===cameraZoom)return;
+ cameraZoom=value;try{localStorage.setItem(cameraZoomKey,String(value));}catch{}
+ renderCameraZoom();
+ const session=cameraSession;
+ if(session?.active){session.viewRevision++;session.consensus.reset();$('camera-progress').textContent='一致 0 / 3 回';$('camera-status').textContent='倍率を変えました。少し離して、番号全体を枠に合わせて止めてください。';}
+}
+document.querySelectorAll('[data-camera-zoom]').forEach(button=>button.onclick=()=>setCameraZoom(Number(button.dataset.cameraZoom)));
+renderCameraZoom();
 function cameraActive(session){return cameraSession===session&&session.active&&$('camera-dialog').open&&!document.hidden;}
 function stopCamera(session=cameraSession){
  if(!session)return;
@@ -152,26 +168,27 @@ async function readCameraFrame(session){
  if(state.box!==session.box){closeCamera();toast('箱番号が変わりました。箱を確認して、もう一度カメラを開いてください。');return;}
  const frameId=$('camera-video').currentTime;
  if(!Number.isFinite(frameId)||frameId===session.lastFrame){scheduleCameraRead(session);return;}
- const canvas=captureCameraFrame();if(!canvas){scheduleCameraRead(session);return;}session.lastFrame=frameId;
+ const viewRevision=session.viewRevision,canvas=captureCameraFrame();if(!canvas){scheduleCameraRead(session);return;}session.lastFrame=frameId;
  const job=(async()=>{
   const {recognizeLiveFrame}=await import('./ocr.js');
   if(!cameraActive(session))return null;
-  return recognizeLiveFrame(canvas,{onProgress:p=>{if(cameraActive(session)&&p.status.includes('準備'))$('camera-status').textContent=p.status+'…';}});
+  if(session.viewRevision!==viewRevision)return null;
+  return recognizeLiveFrame(canvas,{onProgress:p=>{if(cameraActive(session)&&session.viewRevision===viewRevision&&p.status.includes('準備'))$('camera-status').textContent=p.status+'…';}});
  })();
  session.job=job;
  try{
-  const result=await job;if(!result||!cameraActive(session))return;
+  const result=await job;if(!result||!cameraActive(session)||session.viewRevision!==viewRevision)return;
   if(state.box!==session.box){closeCamera();toast('箱番号が変わりました。もう一度照合してください。');return;}
   const check=session.consensus.observe(result.candidates,{frameId,now:performance.now()});
   $('camera-progress').textContent=`一致 ${check.count} / 3 回`;
   $('camera-status').textContent=check.count?`${check.id} を確認中です。そのまま動かさずにお待ちください。`:result.reason==='ambiguous'?'シールが1枚だけ枠に入るようにしてください。':'番号全体を横向きで大きく映し、反射を避けて止めてください。';
   if(check.accepted){const image=canvas.toDataURL('image/jpeg',.8);stopCamera(session);$('camera-dialog').close();showMatch(check.id,image);toast('3回続けて同じ番号を読み取りました。実物の8桁も確認してください。');}
- }catch(e){cameraFailure(session,'自動読み取りを続けられませんでした。再開するか、下の撮影画面を使ってください。');}
+ }catch(e){if(session.viewRevision===viewRevision)cameraFailure(session,'自動読み取りを続けられませんでした。再開するか、下の撮影画面を使ってください。');}
  finally{session.job=null;if(!session.active&&!cameraSession){ocrBusy=false;render();}else scheduleCameraRead(session);}
 }
 async function openCamera(){
  if(ocrBusy||pendingWrites||boxChanging||!ready||!state.roster.length)return;
- clearResult();const session={active:true,stream:null,timer:null,job:null,lastFrame:null,box:state.box,consensus:createScanConsensus()};
+ clearResult();const session={active:true,stream:null,timer:null,job:null,lastFrame:null,viewRevision:0,box:state.box,consensus:createScanConsensus()};
  cameraSession=session;ocrBusy=true;render();$('camera-status').textContent='カメラを準備しています…';$('camera-progress').textContent='一致 0 / 3 回';$('retry-camera').hidden=true;
  if(!$('camera-dialog').open)$('camera-dialog').showModal();
  try{
@@ -181,7 +198,7 @@ async function openCamera(){
   session.stream=media;media.getVideoTracks().forEach(track=>track.addEventListener('ended',()=>cameraFailure(session,'カメラが停止しました。再開ボタンからもう一度お試しください。'),{once:true}));
   $('camera-video').srcObject=media;await $('camera-video').play();
   if(!cameraActive(session))return;
-  $('camera-status').textContent='自動で読み取っています。シール1枚を枠に合わせて止めてください。';scheduleCameraRead(session);
+  $('camera-status').textContent='自動で読み取っています。近づけすぎず、シール1枚を枠に合わせて止めてください。';scheduleCameraRead(session);
  }catch(e){cameraFailure(session,e.name==='NotAllowedError'?'カメラの利用を許可するか、下の「iPhoneの撮影画面を使う」を選んでください。':e.message);}
 }
 $('open-camera').onclick=$('retry-camera').onclick=openCamera;

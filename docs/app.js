@@ -1,5 +1,5 @@
 import {initPWA} from './pwa.js';
-import {newState,parseRoster,validateState,importRoster,lookup,pack,undoPack,exportCSV,boxSummary,normalizeId} from './core.js';
+import {newState,parseRoster,validateState,importRoster,lookup,pack,undoPack,exportCSV,boxSummary,normalizeId,BOX_CAPACITY,BOX_LIMIT} from './core.js';
 
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -10,9 +10,14 @@ const buttons=['open-camera','pick-photo','manual-toggle'];
 function toast(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,4500);}
 function problem(error){toast(error?.message||String(error));}
 function openDB(){return new Promise((resolve,reject)=>{const req=indexedDB.open('terminal-packing-v1',1);req.onupgradeneeded=()=>req.result.createObjectStore('notebook');req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);req.onblocked=()=>reject(new Error('別の画面を閉じてから、もう一度開いてください。'));});}
-function readState(){return new Promise((resolve,reject)=>{const tx=db.transaction('notebook','readonly');const req=tx.objectStore('notebook').get('state');req.onsuccess=()=>{try{resolve(req.result?validateState(req.result):newState());}catch(e){reject(e);}};req.onerror=()=>reject(req.error);});}
-function change(mutator,{replace=false}={}){pendingWrites++;return new Promise((resolve,reject)=>{if(!db||(!ready&&!replace))return reject(new Error('保存先の準備ができていません。'));const tx=db.transaction('notebook','readwrite');const store=tx.objectStore('notebook');let next,issue;const req=store.get('state');req.onsuccess=()=>{try{const current=replace?newState():(req.result?validateState(req.result):newState());next=mutator(current);next.updatedAt=new Date().toISOString();validateState(next);store.put(next,'state');}catch(e){issue=e;tx.abort();}};tx.oncomplete=()=>{state=next;ready=true;$('fatal').hidden=true;render();channel?.postMessage('changed');resolve(next);};tx.onabort=tx.onerror=()=>reject(issue||new Error('記録を保存できませんでした。梱包完了にはしていません。空き容量などを確認してください。'));}).finally(()=>{pendingWrites--;renderBoxControls();});}
-channel?.addEventListener('message',async()=>{if(!db)return;try{state=await readState();render();if(selected){if(selected.box!==state.box&&lookup(state,selected.id).status==='ready'){clearResult();toast('別の画面で箱番号が変わりました。箱を確認して、もう一度端末番号を照合してください。');}else showMatch(selected.id,selected.image);}}catch(e){problem(e);}});
+function readState(){return new Promise((resolve,reject)=>{
+ const tx=db.transaction('notebook','readwrite'),store=tx.objectStore('notebook');let next,issue;
+ const req=store.get('state');
+ req.onsuccess=()=>{try{const raw=req.result;next=raw?validateState(raw):newState();if(raw&&(raw.box!==next.box||raw.records.some((r,i)=>r.box!==next.records[i].box)||raw.events.some((e,i)=>e.box!==next.events[i].box)))store.put(next,'state');}catch(e){issue=e;tx.abort();}};
+ tx.oncomplete=()=>resolve(next);tx.onabort=tx.onerror=()=>reject(issue||tx.error||new Error('保存済みの記録を読み込めませんでした。'));
+});}
+function change(mutator,{replace=false}={}){pendingWrites++;return new Promise((resolve,reject)=>{if(!db||(!ready&&!replace))return reject(new Error('保存先の準備ができていません。'));const tx=db.transaction('notebook','readwrite');const store=tx.objectStore('notebook');let next,issue;const req=store.get('state');req.onsuccess=()=>{try{const current=replace?newState():(req.result?validateState(req.result):newState());next=validateState(mutator(current));next.updatedAt=new Date().toISOString();store.put(next,'state');}catch(e){issue=e;tx.abort();}};tx.oncomplete=()=>{state=next;ready=true;$('fatal').hidden=true;render();channel?.postMessage('changed');resolve(next);};tx.onabort=tx.onerror=()=>reject(issue||new Error('記録を保存できませんでした。梱包完了にはしていません。空き容量などを確認してください。'));}).finally(()=>{pendingWrites--;renderBoxControls();});}
+channel?.addEventListener('message',async()=>{if(!db)return;try{state=await readState();$('box-advance-notice').hidden=true;render();if(selected){if(selected.box!==state.box&&lookup(state,selected.id).status==='ready'){clearResult();toast('別の画面で箱番号が変わりました。箱を確認して、もう一度端末番号を照合してください。');}else showMatch(selected.id,selected.image);}}catch(e){problem(e);}});
 function nav(next){page=next;for(const name of ['scan','records','setup'])$('page-'+name).hidden=name!==next;document.querySelectorAll('.bottom-nav [data-page]').forEach(b=>{b.classList.toggle('active',b.dataset.page===next);b.setAttribute('aria-current',b.dataset.page===next?'page':'false');});if(next==='records')renderRecords();window.scrollTo({top:0,behavior:'instant'});}
 document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>nav(b.dataset.page)));
 $('start-setup').onclick=()=>nav('setup');
@@ -23,7 +28,7 @@ function render(){
  $('stat-packed').innerHTML=count+'<small>台</small>';$('stat-total').innerHTML=(total||'—')+'<small>台</small>';$('stat-left').innerHTML=(total?total-count:'—')+'<small>台</small>';$('progress-bar').style.width=(total?100*count/total:0)+'%';
  $('onboard').hidden=total>0;
  renderBoxControls();
- $('current-box-count').textContent=state.records.filter(r=>r.box===state.box).length+' 台';
+ $('current-box-count').textContent=state.records.filter(r=>r.box===state.box).length+' / '+BOX_CAPACITY+' 台';
  buttons.forEach(id=>$(id).disabled=!ready||!total||ocrBusy);
  $('recent-list').innerHTML=count?[...state.records].sort((a,b)=>b.packedAt.localeCompare(a.packedAt)).slice(0,4).map(r=>`<div class="recent-row"><div><strong>${esc(r.id)}</strong><small>${esc(r.box)} · ${time(r.packedAt)}</small></div><svg class="recent-check"><use href="#i-check"/></svg></div>`).join(''):empty('まだ梱包の記録がありません。<br>最初の1台から始めましょう。');
  $('roster-info').textContent=total?`${state.rosterName} ／ ${total} 台を登録済み`:'番号一覧はまだ登録されていません。';
@@ -39,7 +44,7 @@ function renderRecords(){
 }
 $('search-input').oninput=renderRecords;
 document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{filter=b.dataset.filter;document.querySelectorAll('[data-filter]').forEach(n=>n.classList.toggle('active',n===b));renderRecords();});
-const standardBoxes=Array.from({length:129},(_,i)=>`箱${String(i+1).padStart(2,'0')}`);
+const standardBoxes=Array.from({length:BOX_LIMIT},(_,i)=>String(i+1).padStart(3,'0'));
 let boxOptionsKey='';
 function boxLocked(){return !ready||boxChanging||pendingWrites>0||ocrBusy||Boolean(selected&&lookup(state,selected.id).status==='ready');}
 function renderBoxControls(){
@@ -53,15 +58,17 @@ function renderBoxControls(){
  $('next-box').disabled=locked||index<0||index===standardBoxes.length-1;
  $('box-hint').textContent=selected&&lookup(state,selected.id).status==='ready'
   ? '梱包完了にするか、照合結果を閉じると箱を替えられます。'
-  : index<0 ? '保存済みの箱名です。別の箱へ移るときは一覧から選べます。'
-  : '振り分け表にも、同じ箱番号を書いてください。';
+  : state.records.filter(r=>r.box===state.box).length>=BOX_CAPACITY ? 'この箱は満杯です。空きのある箱を選んでください。'
+  : index<0 ? '保存済みの箱名です。9台になったら別の箱を一覧から選んでください。'
+  : index===standardBoxes.length-1 ? '最後の箱番号です。9台まで記録できます。'
+  : '9台の梱包完了で次の箱へ自動で進みます。振り分け表にも同じ番号を書いてください。';
 }
 async function switchBox(target){
  if(boxLocked())return renderBoxControls();
  if(target===state.box)return;
  const from=state.box;
  boxChanging=true;renderBoxControls();
- try{await change(s=>{if(s.box!==from)throw new Error('別の画面で箱番号が変わりました。現在の箱を確認してください。');return {...s,box:target};});clearResult();toast(`${target} に切り替えました。箱の表示を確認してください。`);}
+ try{await change(s=>{if(s.box!==from)throw new Error('別の画面で箱番号が変わりました。現在の箱を確認してください。');return {...s,box:target};});clearResult();$('box-advance-notice').hidden=true;toast(`箱 ${target} に切り替えました。箱の表示を確認してください。`);}
  catch(e){problem(e);try{state=await readState();render();}catch{}}
  finally{boxChanging=false;renderBoxControls();}
 }
@@ -74,20 +81,31 @@ $('confirm-close').onclick=$('confirm-cancel').onclick=closeConfirm;
 $('confirm-ok').onclick=async()=>{if(!confirmAction)return;$('confirm-ok').disabled=true;try{await confirmAction();closeConfirm();}catch(e){problem(e);$('confirm-ok').disabled=false;}};
 $('confirm-dialog').addEventListener('close',()=>confirmAction=null);
 $('record-list').onclick=e=>{const b=e.target.closest('[data-undo]');if(b)askUndo(b.dataset.undo);};
-function askUndo(id){const r=state.records.find(r=>r.id===id);if(!r)return;confirm('梱包記録を取り消しますか？',`<p><strong>${esc(id)}</strong> ／ ${esc(r.box)}</p><p>この番号を未梱包に戻します。実物の入っている箱も確認してください。</p>`,async()=>{await change(s=>{const actual=s.records.find(n=>n.id===id);if(!actual||actual.box!==r.box||actual.packedAt!==r.packedAt)throw new Error('記録が変更されています。一度閉じて、最新の記録を確認してください。');return undoPack(s,id,new Date().toISOString());});if(selected?.id===id)showMatch(id,selected.image);toast('未梱包に戻しました。');},'記録を取り消す');}
+function askUndo(id){const r=state.records.find(r=>r.id===id);if(!r)return;confirm('梱包記録を取り消しますか？',`<p><strong>${esc(id)}</strong> ／ ${esc(r.box)}</p><p>この番号を未梱包に戻します。実物の入っている箱も確認してください。</p>`,async()=>{await change(s=>{const actual=s.records.find(n=>n.id===id);if(!actual||actual.box!==r.box||actual.packedAt!==r.packedAt)throw new Error('記録が変更されています。一度閉じて、最新の記録を確認してください。');return undoPack(s,id,new Date().toISOString());});$('box-advance-notice').hidden=true;if(selected?.id===id)showMatch(id,selected.image);toast('未梱包に戻しました。');},'記録を取り消す');}
 $('manual-toggle').onclick=()=>{$('manual-form').hidden=!$('manual-form').hidden;if(!$('manual-form').hidden)$('manual-id').focus();};
 $('manual-form').onsubmit=e=>{e.preventDefault();if(ocrBusy)return;showMatch($('manual-id').value,null);};
 function showMatch(raw,image){
  const result=lookup(state,raw),{status,id}=result;selected={id,image,box:state.box};$('result').hidden=false;$('result').className='result-card';
  const photoHTML=image?`<img class="result-photo" src="${image}" alt="読み取ったシールの画像">`:'';
  const number=`<div class="result-number">${esc(id||raw)}</div>${photoHTML}`;
- if(status==='ready'){$('result').innerHTML=`<p class="result-kicker">✓ 対象の端末・未梱包</p>${number}<p>シールと8桁すべてを見比べてください。<br><strong>${esc(state.box)}</strong> に入れてから完了を押します。</p><div class="result-actions"><button type="button" id="pack-now" class="primary">${esc(state.box)} に梱包完了</button><button type="button" id="dismiss-result" class="secondary">戻る</button></div>`;$('pack-now').onclick=completePack;}
+ if(status==='ready'&&state.records.filter(r=>r.box===state.box).length>=BOX_CAPACITY){$('result').classList.add('warning');$('result').innerHTML=`<p class="result-kicker">この箱は9台梱包済みです</p>${number}<p>箱 <strong>${esc(state.box)}</strong> には追加できません。空きのある箱を選び直してから、もう一度照合してください。</p><button type="button" id="dismiss-result" class="secondary">箱を選び直す</button>`;}
+ else if(status==='ready'){$('result').innerHTML=`<p class="result-kicker">✓ 対象の端末・未梱包</p>${number}<p>シールと8桁すべてを見比べてください。<br>箱 <strong>${esc(state.box)}</strong> に入れてから完了を押します。</p><div class="result-actions"><button type="button" id="pack-now" class="primary">箱 ${esc(state.box)} に梱包完了</button><button type="button" id="dismiss-result" class="secondary">戻る</button></div>`;$('pack-now').onclick=completePack;}
  else if(status==='packed'){const r=result.record;$('result').classList.add('warning');$('result').innerHTML=`<p class="result-kicker">登録済みの番号です</p>${number}<p><strong>${esc(r.box)}</strong> に梱包済みです。<br>${time(r.packedAt)} に記録されています。</p><div class="result-actions"><button type="button" id="dismiss-result" class="secondary">次の端末へ</button><button type="button" id="undo-result" class="text-button">この記録を取り消す</button></div>`;$('undo-result').onclick=()=>askUndo(id);}
  else{$('result').classList.add('danger');const title=status==='not-found'?'番号一覧にありません':status==='no-roster'?'番号一覧を登録してください':'8桁の番号を入力してください';$('result').innerHTML=`<p class="result-kicker">${title}</p>${number}<p>番号を確認し、撮り直すか手入力で照合してください。<br>この状態では梱包記録を登録できません。</p><button type="button" id="dismiss-result" class="secondary">戻る</button>`;}
  $('dismiss-result').onclick=clearResult;renderBoxControls();$('result').scrollIntoView({block:'nearest',behavior:'smooth'});
 }
 function clearResult(){selected=null;$('result').hidden=true;$('result').replaceChildren();$('manual-id').value='';renderBoxControls();}
-async function completePack(){const current=selected;if(!current)return;const b=$('pack-now');b.disabled=true;try{await change(s=>{if(s.box!==current.box)throw new Error('箱番号が変わりました。入れる箱を確認して、もう一度完了を押してください。');return pack(s,current.id,current.box,new Date().toISOString());});clearResult();toast(`${current.id} を ${current.box} に記録しました。`);if(state.records.length===1)navigator.storage?.persist?.().catch(()=>{});}catch(e){problem(e);try{state=await readState();render();showMatch(current.id,current.image);}catch{b.disabled=false;}}}
+async function completePack(){
+ const current=selected;if(!current||pendingWrites>0||boxChanging)return;const b=$('pack-now');if(!b||b.disabled)return;b.disabled=true;
+ try{
+  const saved=await change(s=>{if(s.box!==current.box)throw new Error('箱番号が変わりました。入れる箱を確認して、もう一度完了を押してください。');return pack(s,current.id,current.box,new Date().toISOString());});
+  clearResult();const full=saved.records.filter(r=>r.box===current.box).length===BOX_CAPACITY;
+  const notice=$('box-advance-notice');notice.hidden=!full;
+  if(full){const nextFull=saved.records.filter(r=>r.box===saved.box).length>=BOX_CAPACITY;notice.textContent=saved.box!==current.box?(nextFull?`箱 ${current.box} の9台を記録しました。次の箱 ${saved.box} も満杯です。空きのある箱を選んでください。`:`箱 ${current.box} の9台を記録しました。次は箱 ${saved.box} に入れてください。`):`箱 ${current.box} の9台を記録しました。続ける場合は空きのある箱を選んでください。`;notice.scrollIntoView({block:'nearest',behavior:'smooth'});}
+  toast(saved.box!==current.box?`箱 ${current.box} が9台になりました。箱 ${saved.box} に切り替えました。`:`${current.id} を箱 ${current.box} に記録しました。`);
+  if(state.records.length===1)navigator.storage?.persist?.().catch(()=>{});
+ }catch(e){problem(e);try{state=await readState();render();showMatch(current.id,current.image);}catch{b.disabled=false;}}
+}
 
 async function decodeText(file){if(file.size>5*1024*1024)throw new Error('番号一覧は5MB以内のファイルを選んでください。');const bytes=await file.arrayBuffer();let text=new TextDecoder('utf-8').decode(bytes);if(text.includes('\uFFFD')){try{text=new TextDecoder('shift_jis').decode(bytes);}catch{}}return text;}
 $('import-file').onclick=()=>$('roster-file').click();
@@ -101,7 +119,7 @@ async function saveFile(content,type,name){const file=new File([content],name,{t
 $('export-csv').onclick=()=>{if(!state.roster.length)return toast('番号一覧を登録してから書き出してください。');saveFile(exportCSV(state),'text/csv;charset=utf-8',filename('梱包記録','csv')).catch(problem);};
 $('backup').onclick=()=>{if(!state.roster.length)return toast('番号一覧を登録してから保存してください。');saveFile(JSON.stringify(state,null,2),'application/json',filename('端末回収バックアップ','json')).catch(problem);};
 $('restore').onclick=()=>$('restore-file').click();
-$('restore-file').onchange=async e=>{const f=e.target.files?.[0];if(!f)return;try{if(f.size>20*1024*1024)throw new Error('バックアップが大きすぎます。');const restored=validateState(JSON.parse(await f.text()));confirm('バックアップから復元しますか？',`<p>番号一覧 <strong>${restored.roster.length} 台</strong> ／ 梱包済み <strong>${restored.records.length} 台</strong></p><p>現在の一覧と記録を、このバックアップの内容に置き換えます。必要な現在の記録は、先にバックアップを保存してください。</p>`,async()=>{await change(()=>restored,{replace:true});clearResult();nav('scan');toast('バックアップから復元しました。');},'この内容に復元する');}catch(error){problem(new Error('復元できません：'+error.message));}e.target.value='';};
+$('restore-file').onchange=async e=>{const f=e.target.files?.[0];if(!f)return;try{if(f.size>20*1024*1024)throw new Error('バックアップが大きすぎます。');const restored=validateState(JSON.parse(await f.text()));confirm('バックアップから復元しますか？',`<p>番号一覧 <strong>${restored.roster.length} 台</strong> ／ 梱包済み <strong>${restored.records.length} 台</strong></p><p>現在の一覧と記録を、このバックアップの内容に置き換えます。必要な現在の記録は、先にバックアップを保存してください。</p>`,async()=>{await change(()=>restored,{replace:true});$('box-advance-notice').hidden=true;clearResult();nav('scan');toast('バックアップから復元しました。');},'この内容に復元する');}catch(error){problem(new Error('復元できません：'+error.message));}e.target.value='';};
 
 function stopCamera(){if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}$('camera-video').srcObject=null;}
 $('open-camera').onclick=async()=>{if(ocrBusy)return;$('camera-status').textContent='カメラを準備しています…';$('take-photo').disabled=true;$('camera-dialog').showModal();try{if(!navigator.mediaDevices?.getUserMedia)throw new Error('この画面ではカメラを直接開けません。下の「iPhoneの撮影画面を使う」を選んでください。');stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}});if(!$('camera-dialog').open){stopCamera();return;}$('camera-video').srcObject=stream;await $('camera-video').play();$('take-photo').disabled=false;$('camera-status').textContent='他の端末の番号が枠に入らないようにします。';}catch(e){stopCamera();$('camera-status').textContent=e.name==='NotAllowedError'?'カメラの利用を許可するか、下の「iPhoneの撮影画面を使う」を選んでください。':e.message;}};

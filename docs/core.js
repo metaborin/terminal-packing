@@ -2,10 +2,19 @@
 const ID_PATTERN = /^\d{8}$/;
 const MAX_ROSTER = 50000;
 const MAX_EVENTS = 250000;
+export const BOX_CAPACITY = 9;
+export const BOX_LIMIT = 129;
 const HEADER_NAMES = new Set(['端末番号', '管理番号', '端末管理番号', '旧端末番号', 'pc管理番号', 'device', 'deviceid', 'id']);
 
 export function newState() {
-  return { schemaVersion: 1, roster: [], records: [], events: [], box: '箱01', rosterName: '', updatedAt: null };
+  return { schemaVersion: 1, roster: [], records: [], events: [], box: '001', rosterName: '', updatedAt: null };
+}
+
+/** Recognize only the prior numeric box labels; custom names remain exact. */
+export function normalizeBoxNumber(value) {
+  if (typeof value !== 'string' || !/^(?:箱)?\d{1,3}$/.test(value)) return value;
+  const number = Number(value.replace(/^箱/, ''));
+  return number >= 1 && number <= BOX_LIMIT ? String(number).padStart(3, '0') : value;
 }
 
 export function normalizeId(value) {
@@ -110,9 +119,8 @@ function requireTimestamp(now) {
 
 function cleanBox(value) {
   if (typeof value !== 'string') throw new Error('箱番号を入力してください。');
-  const box = value.trim();
-  if (!validBox(box)) throw new Error('箱番号は改行を含まない1～40文字で入力してください。');
-  return box;
+  if (!validBox(value)) throw new Error('箱番号は改行を含まない1～40文字で入力してください。');
+  return value;
 }
 
 /** Returns a detached canonical state or throws. Never repairs an invalid backup silently. */
@@ -150,7 +158,10 @@ export function validateState(obj) {
     const record = packed.get(id);
     if (!record || record.box !== entry.box || record.packedAt !== entry.packedAt) invalid();
   }
-  return { schemaVersion: 1, roster, records, events, box: obj.box, rosterName: obj.rosterName, updatedAt: obj.updatedAt };
+  // Check the original history before migration so aliases cannot hide corruption.
+  for (const record of records) record.box = normalizeBoxNumber(record.box);
+  for (const event of events) event.box = normalizeBoxNumber(event.box);
+  return { schemaVersion: 1, roster, records, events, box: normalizeBoxNumber(obj.box), rosterName: obj.rosterName, updatedAt: obj.updatedAt };
 }
 
 export function importRoster(state, ids, name = '') {
@@ -181,7 +192,7 @@ export function lookup(state, value) {
 export function pack(state, value, box, now) {
   const next = validateState(state);
   requireTimestamp(now);
-  const selectedBox = cleanBox(box);
+  const selectedBox = normalizeBoxNumber(cleanBox(box));
   const result = lookup(next, value);
   const errors = {
     empty: '端末番号を読み取るか入力してください。',
@@ -191,10 +202,15 @@ export function pack(state, value, box, now) {
     packed: `この端末はすでに${result.record?.box || '箱'}に梱包済みです。`
   };
   if (result.status !== 'ready') throw new Error(errors[result.status]);
+  const boxCount = next.records.filter(record => record.box === selectedBox).length;
+  if (boxCount >= BOX_CAPACITY) throw new Error(`箱 ${selectedBox} は${BOX_CAPACITY}台の上限に達しています。別の箱を選んでから梱包してください。`);
   if (next.events.length >= MAX_EVENTS) throw new Error('記録件数の上限に達しました。バックアップを書き出してください。');
   next.records.push({ id: result.id, box: selectedBox, packedAt: now });
   next.events.push({ type: 'pack', id: result.id, box: selectedBox, at: now });
   next.box = selectedBox;
+  if (boxCount + 1 === BOX_CAPACITY && /^\d{3}$/.test(selectedBox) && Number(selectedBox) >= 1 && Number(selectedBox) < BOX_LIMIT) {
+    next.box = String(Number(selectedBox) + 1).padStart(3, '0');
+  }
   next.updatedAt = now;
   return next;
 }

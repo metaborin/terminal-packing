@@ -125,6 +125,7 @@ $('restore-file').onchange=async e=>{const f=e.target.files?.[0];if(!f)return;tr
 
 // A session owns its stream, pending OCR and timer. Late results never reach another session.
 const cameraZoomLevels=[1,1.5,2],cameraZoomKey='terminal-packing-camera-zoom-v1';
+const liveReadings=2;
 let cameraZoom=2;
 try{const saved=Number(localStorage.getItem(cameraZoomKey));if(cameraZoomLevels.includes(saved))cameraZoom=saved;}catch{}
 function renderCameraZoom(){
@@ -136,22 +137,28 @@ function setCameraZoom(value){
  cameraZoom=value;try{localStorage.setItem(cameraZoomKey,String(value));}catch{}
  renderCameraZoom();
  const session=cameraSession;
- if(session?.active){session.viewRevision++;session.consensus.reset();$('camera-progress').textContent='一致 0 / 3 回';$('camera-status').textContent='倍率を変えました。少し離して、番号全体を枠に合わせて止めてください。';}
+ if(session?.active){session.viewRevision++;session.consensus.reset();clearCameraFreeze();$('camera-progress').textContent=`一致 0 / ${liveReadings} 回`;$('camera-status').textContent='倍率を変えました。少し離して、番号全体を枠に合わせて止めてください。';}
 }
 document.querySelectorAll('[data-camera-zoom]').forEach(button=>button.onclick=()=>setCameraZoom(Number(button.dataset.cameraZoom)));
 renderCameraZoom();
 function cameraActive(session){return cameraSession===session&&session.active&&$('camera-dialog').open&&!document.hidden;}
+function clearCameraFreeze(){
+ $('camera-freeze').hidden=true;$('camera-freeze').removeAttribute('src');$('camera-video').parentElement.classList.remove('is-verifying');
+}
+function freezeCamera(canvas){
+ const image=canvas.toDataURL('image/jpeg',.85);$('camera-freeze').src=image;$('camera-freeze').hidden=false;$('camera-video').parentElement.classList.add('is-verifying');return image;
+}
 function stopCamera(session=cameraSession){
  if(!session)return;
  session.active=false;clearTimeout(session.timer);session.consensus.reset();
  session.stream?.getTracks().forEach(track=>track.stop());
  if($('camera-video').srcObject===session.stream)$('camera-video').srcObject=null;
- if(cameraSession===session){cameraSession=null;ocrBusy=Boolean(session.job);render();}
+ if(cameraSession===session){clearCameraFreeze();cameraSession=null;ocrBusy=Boolean(session.job);render();}
 }
 function closeCamera(){stopCamera();if($('camera-dialog').open)$('camera-dialog').close();}
 function cameraFailure(session,message){
  if(!cameraActive(session))return;
- stopCamera(session);$('camera-status').textContent=message;$('camera-progress').textContent='一致 0 / 3 回';$('retry-camera').hidden=false;
+ stopCamera(session);$('camera-status').textContent=message;$('camera-progress').textContent=`一致 0 / ${liveReadings} 回`;$('retry-camera').hidden=false;
 }
 function captureCameraFrame(){
  const v=$('camera-video');if(v.readyState<2||!v.videoWidth||!v.videoHeight)return null;
@@ -162,7 +169,7 @@ function captureCameraFrame(){
  const c=document.createElement('canvas'),size=Math.min(1,1680/w);c.width=Math.round(w*size);c.height=Math.round(h*size);
  c.getContext('2d').drawImage(v,x,y,w,h,0,0,c.width,c.height);return c;
 }
-function scheduleCameraRead(session){if(cameraActive(session))session.timer=setTimeout(()=>readCameraFrame(session),350);}
+function scheduleCameraRead(session){if(cameraActive(session))session.timer=setTimeout(()=>readCameraFrame(session),60);}
 async function readCameraFrame(session){
  if(!cameraActive(session)||session.job)return;
  if(state.box!==session.box){closeCamera();toast('箱番号が変わりました。箱を確認して、もう一度カメラを開いてください。');return;}
@@ -170,26 +177,39 @@ async function readCameraFrame(session){
  if(!Number.isFinite(frameId)||frameId===session.lastFrame){scheduleCameraRead(session);return;}
  const viewRevision=session.viewRevision,canvas=captureCameraFrame();if(!canvas){scheduleCameraRead(session);return;}session.lastFrame=frameId;
  const job=(async()=>{
-  const {recognizeLiveFrame}=await import('./ocr.js');
+  const {recognizeLiveSample}=await import('./ocr.js');
   if(!cameraActive(session))return null;
   if(session.viewRevision!==viewRevision)return null;
-  return recognizeLiveFrame(canvas,{onProgress:p=>{if(cameraActive(session)&&session.viewRevision===viewRevision&&p.status.includes('準備'))$('camera-status').textContent=p.status+'…';}});
+  return recognizeLiveSample(canvas,{onProgress:p=>{if(cameraActive(session)&&session.viewRevision===viewRevision&&p.status.includes('準備'))$('camera-status').textContent=p.status+'…';}});
  })();
  session.job=job;
  try{
   const result=await job;if(!result||!cameraActive(session)||session.viewRevision!==viewRevision)return;
   if(state.box!==session.box){closeCamera();toast('箱番号が変わりました。もう一度照合してください。');return;}
   const check=session.consensus.observe(result.candidates,{frameId,now:performance.now()});
-  $('camera-progress').textContent=`一致 ${check.count} / 3 回`;
-  $('camera-status').textContent=check.count?`${check.id} を確認中です。そのまま動かさずにお待ちください。`:result.reason==='ambiguous'?'シールが1枚だけ枠に入るようにしてください。':'番号全体を横向きで大きく映し、反射を避けて止めてください。';
-  if(check.accepted){const image=canvas.toDataURL('image/jpeg',.8);stopCamera(session);$('camera-dialog').close();showMatch(check.id,image);toast('3回続けて同じ番号を読み取りました。実物の8桁も確認してください。');}
+  $('camera-progress').textContent=`一致 ${check.count} / ${liveReadings} 回`;
+  $('camera-status').textContent=check.count?`${check.id} を読み取りました。あと1回確認します。`:result.reason==='ambiguous'?'シールが1枚だけ枠に入るようにしてください。':'番号全体を横向きで大きく映し、反射を避けて止めてください。';
+  if(check.accepted){
+   const expectedId=check.id,image=freezeCamera(canvas);
+   $('camera-progress').textContent='取り込んだ画像を再確認中';$('camera-status').textContent='ここからはiPhoneを動かしても大丈夫です。表示された画像で確認しています。';
+   const {verifyLiveSample}=await import('./ocr.js');
+   if(!cameraActive(session)||session.viewRevision!==viewRevision)return;
+   if(state.box!==session.box){closeCamera();toast('箱番号が変わりました。もう一度照合してください。');return;}
+   const verification=verifyLiveSample(canvas,expectedId);session.job=verification;
+   const verified=await verification;
+   if(!cameraActive(session)||session.viewRevision!==viewRevision)return;
+   if(state.box!==session.box){closeCamera();toast('箱番号が変わりました。もう一度照合してください。');return;}
+   const candidate=verified.candidates?.[0];
+   if(verified.candidates?.length===1&&candidate.id===expectedId&&Number.isFinite(candidate.confidence)&&candidate.confidence>=70&&candidate.confidence<=100){stopCamera(session);$('camera-dialog').close();showMatch(expectedId,image);toast('番号を読み取りました。実物の8桁も確認してください。');}
+   else{session.consensus.reset();clearCameraFreeze();$('camera-progress').textContent=`一致 0 / ${liveReadings} 回`;$('camera-status').textContent='確認できませんでした。もう一度シールを枠に合わせてください。';}
+  }
  }catch(e){if(session.viewRevision===viewRevision)cameraFailure(session,'自動読み取りを続けられませんでした。再開するか、下の撮影画面を使ってください。');}
  finally{session.job=null;if(!session.active&&!cameraSession){ocrBusy=false;render();}else scheduleCameraRead(session);}
 }
 async function openCamera(){
  if(ocrBusy||pendingWrites||boxChanging||!ready||!state.roster.length)return;
- clearResult();const session={active:true,stream:null,timer:null,job:null,lastFrame:null,viewRevision:0,box:state.box,consensus:createScanConsensus()};
- cameraSession=session;ocrBusy=true;render();$('camera-status').textContent='カメラを準備しています…';$('camera-progress').textContent='一致 0 / 3 回';$('retry-camera').hidden=true;
+ clearResult();clearCameraFreeze();const session={active:true,stream:null,timer:null,job:null,lastFrame:null,viewRevision:0,box:state.box,consensus:createScanConsensus({required:liveReadings})};
+ cameraSession=session;ocrBusy=true;render();$('camera-status').textContent='カメラを準備しています…';$('camera-progress').textContent=`一致 0 / ${liveReadings} 回`;$('retry-camera').hidden=true;
  if(!$('camera-dialog').open)$('camera-dialog').showModal();
  try{
   if(!navigator.mediaDevices?.getUserMedia)throw new Error('この画面ではカメラを直接開けません。下の「iPhoneの撮影画面を使う」を選んでください。');

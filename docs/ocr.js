@@ -5,6 +5,8 @@ const vendorURL = new URL('./vendor/', import.meta.url);
 let workerPromise = null;
 let progressListener = null;
 let busy = false;
+const LIVE_SAMPLE_WIDTH = 800;
+const LIVE_VERIFY_WIDTH = 1100;
 
 const progressLabels = {
   'loading tesseract core': '読み取りエンジンを準備しています',
@@ -57,12 +59,14 @@ async function getWorker() {
   return workerPromise;
 }
 
-function prepare(source, contrast = false) {
+function prepare(source, contrast = false, liveWidth = null) {
   const width = source.width;
   const height = source.height;
   if (!width || !height) throw new Error('写真を読み込めませんでした。もう一度撮影してください。');
   // A label should fill the guide. Bound working memory on mobile devices.
-  const scale = Math.min(1600 / width, 900 / height, Math.max(1, 1100 / width));
+  const scale = liveWidth === null
+    ? Math.min(1600 / width, 900 / height, Math.max(1, 1100 / width))
+    : Math.min(liveWidth / width, 900 / height);
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(width * scale)) + 48;
   canvas.height = Math.max(1, Math.round(height * scale)) + 48;
@@ -111,14 +115,45 @@ export function candidatesFromText(text, confidence = 0) {
   return [...ids].map(id => ({ id, confidence: Math.max(0, Math.min(100, Number(confidence) || 0)) }));
 }
 
-/** Read one horizontal label. OCR is a suggestion; the user must confirm its digits. */
-export async function recognize(canvas, { onProgress } = {}) {
+async function runOCR(onProgress, snapshot, read, errorMessage) {
   if (busy) throw new Error('読み取り中です。完了するまでお待ちください。');
   busy = true;
   progressListener = onProgress;
+  let worker;
   try {
+    // Capture inputs before awaiting initialization or another asynchronous operation.
+    const input = snapshot();
     notify({ status: 'initializing api', progress: 0 });
-    const worker = await getWorker();
+    worker = await getWorker();
+    return await read(worker, input);
+  } catch (error) {
+    if (worker) {
+      workerPromise = null;
+      try { await worker.terminate(); } catch { /* A fresh worker will be created on retry. */ }
+    }
+    if (error?.message?.includes('写真を読み込めません')) throw error;
+    throw new Error(errorMessage, { cause: error });
+  } finally {
+    progressListener = null;
+    busy = false;
+  }
+}
+
+function liveReading(result) {
+  const text = typeof result?.data?.text === 'string' ? result.data.text : '';
+  const confidence = result?.data?.confidence;
+  const candidates = candidatesFromText(text, Number.isFinite(confidence) && confidence >= 0 && confidence <= 100 ? confidence : 0);
+  if (candidates.length > 1) return { candidates: [], text, reason: 'ambiguous' };
+  if (candidates.length !== 1) return { candidates: [], text, reason: 'empty' };
+  if (candidates[0].confidence < 70) return { candidates: [], text, reason: 'low-confidence' };
+  return { candidates, text, reason: 'agree' };
+}
+
+const liveErrorMessage = '番号を読み取れませんでした。シールを横向きで大きく映して、もう一度お試しください。';
+
+/** Read one horizontal label. OCR is a suggestion; the user must confirm its digits. */
+export async function recognize(canvas, { onProgress } = {}) {
+  return runOCR(onProgress, () => canvas, async worker => {
     await worker.setParameters({ tessedit_pageseg_mode: '7' });
     let result = await worker.recognize(prepare(canvas), {}, { text: true });
     let candidates = candidatesFromText(result.data.text, result.data.confidence);
@@ -129,26 +164,31 @@ export async function recognize(canvas, { onProgress } = {}) {
       candidates = candidatesFromText(result.data.text, result.data.confidence);
     }
     return { candidates, text: result.data.text || '' };
-  } catch (error) {
-    if (error?.message?.includes('写真を読み込めません')) throw error;
-    throw new Error('番号を読み取れませんでした。シールを横向きで大きく写して再撮影するか、番号を入力してください。', { cause: error });
-  } finally {
-    progressListener = null;
-    busy = false;
-  }
+  }, '番号を読み取れませんでした。シールを横向きで大きく写して再撮影するか、番号を入力してください。');
+}
+
+/** One normal reading of a fresh camera frame. Cross-frame agreement is checked by the caller. */
+export async function recognizeLiveSample(canvas, { onProgress } = {}) {
+  return runOCR(onProgress, () => prepare(canvas, false, LIVE_SAMPLE_WIDTH), async (worker, prepared) => {
+    await worker.setParameters({ tessedit_pageseg_mode: '7' });
+    return liveReading(await worker.recognize(prepared, {}, { text: true }));
+  }, liveErrorMessage);
+}
+
+/** Verify the saved frame with a different treatment; never substitute a similar number. */
+export async function verifyLiveSample(canvas, expectedId, { onProgress } = {}) {
+  if (typeof expectedId !== 'string' || !/^\d{8}$/.test(expectedId)) return { candidates: [], text: '', reason: 'unstable' };
+  return runOCR(onProgress, () => prepare(canvas, 'stretch', LIVE_VERIFY_WIDTH), async (worker, prepared) => {
+    await worker.setParameters({ tessedit_pageseg_mode: '7' });
+    const result = liveReading(await worker.recognize(prepared, {}, { text: true }));
+    if (result.candidates.length === 1 && result.candidates[0].id !== expectedId) return { candidates: [], text: result.text, reason: 'unstable' };
+    return result;
+  }, liveErrorMessage);
 }
 
 /** Two differently processed readings must agree before a live frame is useful. */
 export async function recognizeLiveFrame(canvas, { onProgress } = {}) {
-  if (busy) throw new Error('読み取り中です。完了するまでお待ちください。');
-  busy = true;
-  progressListener = onProgress;
-  let worker;
-  try {
-    // Snapshot both variants before awaiting OCR; neither reads a later video frame.
-    const normal = prepare(canvas), contrast = prepare(canvas, 'stretch');
-    notify({ status: 'initializing api', progress: 0 });
-    worker = await getWorker();
+  return runOCR(onProgress, () => [prepare(canvas), prepare(canvas, 'stretch')], async (worker, [normal, contrast]) => {
     await worker.setParameters({ tessedit_pageseg_mode: '7' });
     const first = await worker.recognize(normal, {}, { text: true });
     const second = await worker.recognize(contrast, {}, { text: true });
@@ -163,17 +203,7 @@ export async function recognizeLiveFrame(canvas, { onProgress } = {}) {
     if (a.id !== b.id) return { candidates: [], text, reason: 'unstable' };
     if (a.confidence < 70 || b.confidence < 70) return { candidates: [], text, reason: 'low-confidence' };
     return { candidates: [{ id: a.id, confidence: Math.min(a.confidence, b.confidence) }], text, reason: 'agree' };
-  } catch (error) {
-    if (worker) {
-      workerPromise = null;
-      try { await worker.terminate(); } catch { /* A fresh worker will be created on retry. */ }
-    }
-    if (error?.message?.includes('写真を読み込めません')) throw error;
-    throw new Error('番号を読み取れませんでした。シールを横向きで大きく映して、もう一度お試しください。', { cause: error });
-  } finally {
-    progressListener = null;
-    busy = false;
-  }
+  }, liveErrorMessage);
 }
 
 export async function dispose() {

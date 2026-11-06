@@ -6,6 +6,7 @@ const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const time=iso=>new Date(iso).toLocaleString('ja-JP',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
 let state=newState(),db,ready=false,page='scan',filter='all',ocrBusy=false,pendingWrites=0,boxChanging=false,cameraSession=null,photo=null,selected=null,confirmAction=null,toastTimer,importName='貼り付けた番号一覧';
+let scanNavigation=0;
 const channel='BroadcastChannel' in window?new BroadcastChannel('packing-notebook-v1'):null;
 const buttons=['open-camera','pick-photo','manual-toggle'];
 function toast(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,4500);}
@@ -19,7 +20,7 @@ function readState(){return new Promise((resolve,reject)=>{
 });}
 function change(mutator,{replace=false}={}){pendingWrites++;return new Promise((resolve,reject)=>{if(!db||(!ready&&!replace))return reject(new Error('保存先の準備ができていません。'));const tx=db.transaction('notebook','readwrite');const store=tx.objectStore('notebook');let next,issue;const req=store.get('state');req.onsuccess=()=>{try{const current=replace?newState():(req.result?validateState(req.result):newState());next=validateState(mutator(current));next.updatedAt=new Date().toISOString();store.put(next,'state');}catch(e){issue=e;tx.abort();}};tx.oncomplete=()=>{state=next;ready=true;$('fatal').hidden=true;render();channel?.postMessage('changed');resolve(next);};tx.onabort=tx.onerror=()=>reject(issue||new Error('記録を保存できませんでした。梱包完了にはしていません。空き容量などを確認してください。'));}).finally(()=>{pendingWrites--;renderBoxControls();});}
 channel?.addEventListener('message',async()=>{if(!db)return;try{state=await readState();$('box-advance-notice').hidden=true;if(cameraSession&&cameraSession.box!==state.box){closeCamera();toast('別の画面で箱番号が変わりました。箱を確認して、もう一度読み取ってください。');}render();if(selected){if(selected.box!==state.box&&lookup(state,selected.id).status==='ready'){clearResult();toast('別の画面で箱番号が変わりました。箱を確認して、もう一度端末番号を照合してください。');}else showMatch(selected.id,selected.image);}}catch(e){problem(e);}});
-function nav(next){page=next;for(const name of ['scan','records','setup'])$('page-'+name).hidden=name!==next;document.querySelectorAll('.bottom-nav [data-page]').forEach(b=>{b.classList.toggle('active',b.dataset.page===next);b.setAttribute('aria-current',b.dataset.page===next?'page':'false');});if(next==='records')renderRecords();window.scrollTo({top:0,behavior:'instant'});}
+function nav(next){scanNavigation++;page=next;for(const name of ['scan','records','setup'])$('page-'+name).hidden=name!==next;document.querySelectorAll('.bottom-nav [data-page]').forEach(b=>{b.classList.toggle('active',b.dataset.page===next);b.setAttribute('aria-current',b.dataset.page===next?'page':'false');});if(next==='records')renderRecords();window.scrollTo({top:0,behavior:'instant'});}
 document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>nav(b.dataset.page)));
 $('start-setup').onclick=()=>nav('setup');
 $('date-label').textContent=new Date().toLocaleDateString('ja-JP',{month:'long',day:'numeric',weekday:'short'});
@@ -99,14 +100,25 @@ function showMatch(raw,image){
 function clearResult(){selected=null;$('result').hidden=true;$('result').replaceChildren();$('manual-id').value='';renderBoxControls();}
 async function completePack(){
  const current=selected;if(!current||pendingWrites>0||boxChanging)return;const b=$('pack-now');if(!b||b.disabled)return;b.disabled=true;
+ const navigation=scanNavigation;let saved;
  try{
-  const saved=await change(s=>{if(s.box!==current.box)throw new Error('箱番号が変わりました。入れる箱を確認して、もう一度完了を押してください。');return pack(s,current.id,current.box,new Date().toISOString());});
-  clearResult();const full=saved.records.filter(r=>r.box===current.box).length===BOX_CAPACITY;
-  const notice=$('box-advance-notice');notice.hidden=!full;
-  if(full){const nextFull=saved.records.filter(r=>r.box===saved.box).length>=BOX_CAPACITY;notice.textContent=saved.box!==current.box?(nextFull?`箱 ${current.box} の9台を記録しました。次の箱 ${saved.box} も満杯です。空きのある箱を選んでください。`:`箱 ${current.box} の9台を記録しました。次は箱 ${saved.box} に入れてください。`):`箱 ${current.box} の9台を記録しました。続ける場合は空きのある箱を選んでください。`;notice.scrollIntoView({block:'nearest',behavior:'smooth'});}
-  toast(saved.box!==current.box?`箱 ${current.box} が9台になりました。箱 ${saved.box} に切り替えました。`:`${current.id} を箱 ${current.box} に記録しました。`);
-  if(state.records.length===1)navigator.storage?.persist?.().catch(()=>{});
- }catch(e){problem(e);try{state=await readState();render();showMatch(current.id,current.image);}catch{b.disabled=false;}}
+  saved=await change(s=>{if(s.box!==current.box)throw new Error('箱番号が変わりました。入れる箱を確認して、もう一度完了を押してください。');return pack(s,current.id,current.box,new Date().toISOString());});
+ }catch(e){problem(e);try{state=await readState();render();if(selected===current)showMatch(current.id,current.image);}catch{b.disabled=false;}return;}
+ // A committed packing record stays saved even if opening the next camera fails.
+ const sameResult=selected===current;if(sameResult)clearResult();
+ const full=saved.records.filter(r=>r.box===current.box).length===BOX_CAPACITY;
+ const nextFull=saved.records.filter(r=>r.box===saved.box).length>=BOX_CAPACITY;
+ const allDone=saved.records.length===saved.roster.length;
+ const resumeCamera=sameResult&&navigation===scanNavigation&&page==='scan'&&!document.hidden&&state===saved&&!allDone&&!nextFull&&!cameraSession&&!document.querySelector('dialog[open]');
+ const notice=$('box-advance-notice');notice.hidden=!full&&!allDone;
+ if(allDone)notice.textContent=`対象の全 ${saved.roster.length} 台の梱包を記録しました。バックアップを保存してください。`;
+ else if(full)notice.textContent=saved.box!==current.box?(nextFull?`箱 ${current.box} の9台を記録しました。次の箱 ${saved.box} も満杯です。空きのある箱を選んでください。`:`箱 ${current.box} の9台を記録しました。次は箱 ${saved.box} に入れてください。`):`箱 ${current.box} の9台を記録しました。続ける場合は空きのある箱を選んでください。`;
+ if(!notice.hidden&&!resumeCamera)notice.scrollIntoView({block:'nearest',behavior:'smooth'});
+ toast(allDone?'すべての対象端末を梱包済みにしました。':saved.box!==current.box?`箱 ${current.box} が9台になりました。箱 ${saved.box} に切り替えました。`:`${current.id} を箱 ${current.box} に記録しました。`);
+ if(saved.records.length===1)navigator.storage?.persist?.().catch(()=>{});
+ if(!resumeCamera)return;
+ try{await openCamera({afterPack:current});}
+ catch{closeCamera();toast('梱包記録は保存済みです。「カメラで自動読み取り」から再開してください。');}
 }
 
 async function decodeText(file){if(file.size>5*1024*1024)throw new Error('番号一覧は5MB以内のファイルを選んでください。');const bytes=await file.arrayBuffer();let text=new TextDecoder('utf-8').decode(bytes);if(text.includes('\uFFFD')){try{text=new TextDecoder('shift_jis').decode(bytes);}catch{}}return text;}
@@ -186,6 +198,7 @@ async function readCameraFrame(session){
  try{
   const result=await job;if(!result||!cameraActive(session)||session.viewRevision!==viewRevision)return;
   if(state.box!==session.box){closeCamera();toast('箱番号が変わりました。もう一度照合してください。');return;}
+  if(session.skipId&&result.candidates?.length===1&&result.candidates[0].id===session.skipId){session.consensus.reset();$('camera-progress').textContent=`一致 0 / ${liveReadings} 回`;$('camera-status').textContent='この端末は記録済みです。次の端末のシールをかざしてください。';return;}
   const check=session.consensus.observe(result.candidates,{frameId,now:performance.now()});
   $('camera-progress').textContent=`一致 ${check.count} / ${liveReadings} 回`;
   $('camera-status').textContent=check.count?`${check.id} を読み取りました。あと1回確認します。`:result.reason==='ambiguous'?'シールが1枚だけ枠に入るようにしてください。':'番号全体を横向きで大きく映し、反射を避けて止めてください。';
@@ -206,11 +219,20 @@ async function readCameraFrame(session){
  }catch(e){if(session.viewRevision===viewRevision)cameraFailure(session,'自動読み取りを続けられませんでした。再開するか、下の撮影画面を使ってください。');}
  finally{session.job=null;if(!session.active&&!cameraSession){ocrBusy=false;render();}else scheduleCameraRead(session);}
 }
-async function openCamera(){
- if(ocrBusy||pendingWrites||boxChanging||!ready||!state.roster.length)return;
- clearResult();clearCameraFreeze();const session={active:true,stream:null,timer:null,job:null,lastFrame:null,viewRevision:0,box:state.box,consensus:createScanConsensus({required:liveReadings})};
+async function openCamera({afterPack=null}={}){
+ if(ocrBusy||pendingWrites||boxChanging||!ready||!state.roster.length||document.hidden)return;
+ document.activeElement?.blur();
+ // Finish any result-card scrolling before the camera becomes visible.
+ window.scrollTo({top:window.scrollY,left:window.scrollX,behavior:'instant'});
+ clearResult();clearCameraFreeze();const session={active:true,stream:null,timer:null,job:null,lastFrame:null,viewRevision:0,box:state.box,skipId:afterPack?.id,consensus:createScanConsensus({required:liveReadings})};
+ $('camera-box').textContent=`箱 ${session.box}`;
+ $('camera-box-count').textContent=`${state.records.filter(r=>r.box===session.box).length} / ${BOX_CAPACITY} 台`;
+ const notice=$('camera-next-notice');notice.hidden=!afterPack;
+ notice.textContent=afterPack?(afterPack.box!==session.box?`箱 ${afterPack.box} が9台になりました。次は箱 ${session.box} に入れてください。`:`箱 ${afterPack.box} に記録しました。次の端末をかざしてください。`):'';
+ notice.classList.toggle('box-changed',Boolean(afterPack&&afterPack.box!==session.box));
  cameraSession=session;ocrBusy=true;render();$('camera-status').textContent='カメラを準備しています…';$('camera-progress').textContent=`一致 0 / ${liveReadings} 回`;$('retry-camera').hidden=true;
  if(!$('camera-dialog').open)$('camera-dialog').showModal();
+ $('camera-dialog').scrollTop=0;
  try{
   if(!navigator.mediaDevices?.getUserMedia)throw new Error('この画面ではカメラを直接開けません。下の「iPhoneの撮影画面を使う」を選んでください。');
   const media=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}});
@@ -226,8 +248,8 @@ $('close-camera').onclick=closeCamera;
 $('camera-dialog').addEventListener('close',()=>{if(!$('camera-dialog').open)stopCamera();});
 $('camera-dialog').addEventListener('cancel',closeCamera);
 $('camera-fallback').onclick=()=>{closeCamera();$('capture-input').click();};
-document.addEventListener('visibilitychange',()=>{if(document.hidden)closeCamera();});
-window.addEventListener('pagehide',closeCamera);
+document.addEventListener('visibilitychange',()=>{if(document.hidden){scanNavigation++;closeCamera();}});
+window.addEventListener('pagehide',()=>{scanNavigation++;closeCamera();});
 
 $('pick-photo').onclick=()=>$('photo-input').click();
 for(const id of ['photo-input','capture-input'])$(id).onchange=async e=>{const f=e.target.files?.[0];e.target.value='';if(!f)return;try{if(f.size>35*1024*1024)throw new Error('35MB以内の写真を選んでください。');await loadPhoto(f);}catch(error){problem(error);}};
